@@ -1,16 +1,22 @@
 # -*- coding: windows-1252 -*-
 import re
-import time
 import threading
 import tkinter as tk
 from tkinter import Text
-from pynput import keyboard
 from pynput.keyboard import Controller, Key, Listener, KeyCode
 
 
-
 class AutoTyper:
-    def __init__(self): 
+    KEY_MAP = {
+        'left': Key.left,
+        'right': Key.right,
+        'up': Key.up,
+        'down': Key.down,
+        'delete': Key.delete,
+        'backspace': Key.backspace,
+    }
+
+    def __init__(self):
         app_description = """
 1. **Graphical User Interface**: The program has a simple GUI with a large text input field and a 'Run' button. Enter your text and commands into this field and start the auto-typing process by clicking the 'Run' button.
 2. **Text Input**: The program accepts any text input. This text will be automatically typed out by the program.
@@ -19,7 +25,7 @@ class AutoTyper:
     - `[new_line_delay=1000]`: Sets the delay time after the auto-typer presses 'Enter' to create a new line. The delay is measured in milliseconds. Replace `1000` with any positive integer.
     - `[wait_to_continue=0x12]`: Pauses the auto-typer until the user presses the specified key (e.g., '0x12' is the Virtual-Key Code for 'Alt (Right)'). Replace '0x12' with any valid Virtual-Key Code.
     - `[delay=500]`: Pauses the auto-typing process for the specified time (in milliseconds). Replace `500` with any positive integer.
-    - `[key=right]: This command instructs the auto-typer to press a specific key. In this case, it’s the right arrow key. You can replace right with up, down, or left to make the auto-typer press the corresponding arrow key.`
+    - `[key=right]: This command instructs the auto-typer to press a specific key. In this case, itâ€™s the right arrow key. You can replace right with up, down, or left to make the auto-typer press the corresponding arrow key.`
 4. **Command Execution**: The program executes the special commands as it encounters them in the text.
 5. **Text Output**: All other text that is not enclosed in square brackets is typed out by the program as regular text.
 6. **Immediate Stop**: Press the 'Escape' key to stop the auto-typing process immediately.
@@ -42,6 +48,12 @@ println("This is the third line")[key=right]}
             'wait_to_continue': None,
             'key': None
         }
+
+        self.stop_typing = threading.Event()
+        self.listener = None        # global Esc listener
+        self.wait_listener = None   # listener used by wait_to_continue
+        self.typing_thread = None
+
         self.root = tk.Tk()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -64,14 +76,12 @@ println("This is the third line")[key=right]}
         self.clear_button = tk.Button(button_frame, text='Clear', command=self.clear_text)
         self.clear_button.pack(side=tk.LEFT)
 
-        self.stop_typing = threading.Event()
-
         # Configure the grid to expand the textbox when the window is resized
         self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
 
     def clear_text(self):
-        self.text_input.delete('1.0', 'end')  # Clear the text input field        
+        self.text_input.delete('1.0', 'end')  # Clear the text input field
 
     def getValOfKey(self, key):
         VK_CODE = {
@@ -82,118 +92,160 @@ println("This is the third line")[key=right]}
             'Key.alt_r': 0xA5,
             # Add more keys as needed
         }
-        return VK_CODE.get(str(key), None)        
+        return VK_CODE.get(str(key), None)
 
-    def for_hotkey(self, key):
-        self.hotkey.press(key)
+    # ------------------------------------------------------------------
+    # Esc handling
+    # ------------------------------------------------------------------
+    def stop_all(self):
+        """Stop typing immediately: set the flag and release anything blocking."""
+        self.stop_typing.set()
+        wait_listener = self.wait_listener
+        if wait_listener is not None:
+            wait_listener.stop()  # unblocks wait_listener.join() in the typing thread
 
-    def on_hotkey_pressed(self):
-        print("on_hotkey_pressed-> Esc")
-        self.stop_typing.set()  # Stop typing when the hotkey is pressed
-        self.listener.stop()  # Stop the hotkey listener
+    def on_esc_listener_press(self, key):
+        if key == Key.esc:
+            print("on_esc_listener_press-> Esc")
+            self.stop_all()
+            return False  # stop the Esc listener
 
     def on_press(self, key):
-        target_vk = self.commands['wait_to_continue'].vk
+        """Listener callback for wait_to_continue."""
+        if key == Key.esc:
+            self.stop_all()
+            return False
+
+        target = self.commands['wait_to_continue']
+        if target is None:
+            return False
+        target_vk = target.vk
         current_vk = self.getValOfKey(key)
         print(f"on_press-> target_vk = {target_vk} | current_vk = {current_vk}")
         if target_vk == current_vk:
             return False  # Stop the listener when the specified key is pressed
 
+    # ------------------------------------------------------------------
+    # Helpers that respect the stop flag
+    # ------------------------------------------------------------------
+    def _sleep(self, seconds):
+        """Interruptible sleep. Returns True if Esc was pressed meanwhile."""
+        return self.stop_typing.wait(seconds)
+
+    def _tap(self, key):
+        """Press and release a key, unless typing was stopped."""
+        if self.stop_typing.is_set():
+            return
+        self.keyboard.press(key)
+        self.keyboard.release(key)
+
+    # ------------------------------------------------------------------
+    # Main typing logic
+    # ------------------------------------------------------------------
     def auto_type(self, text):
         lines = text.split('\n')
         for i, line in enumerate(lines):
             for segment in re.split(r'(\[[^\]]*\])', line):
+                if self.stop_typing.is_set():
+                    return
+
                 command, value = None, None
                 if segment.startswith('[') and segment.endswith(']'):
                     segment_copy = segment[1:-1]
                     if '=' in segment_copy:
-                        command, value = segment_copy.split('=')
+                        command, value = segment_copy.split('=', 1)
+
                 if command in self.commands:
                     print(f"auto_type-> command, value = {command}, {value}")
-                    if command == 'wait_to_continue':
-                        self.commands[command] = KeyCode.from_vk(int(value, 16))  # Convert the string to a KeyCode object
-                    elif command == 'delay':
-                        print(f"auto_type-> delay = {value}")
-                        time.sleep(int(value) / 1000)
-                    elif command == 'key':
-                        if(value == 'left'):
-                            self.keyboard.press(Key.left)
-                            self.keyboard.release(Key.left)   
-                        elif(value == 'right'):
-                            self.keyboard.press(Key.right)
-                            self.keyboard.release(Key.right)
-                        elif(value == 'up'):
-                            self.keyboard.press(Key.up)
-                            self.keyboard.release(Key.up)
-                        elif(value == 'down'):
-                            self.keyboard.press(Key.down)
-                            self.keyboard.release(Key.down)
-                        elif(value == 'delete'):
-                            self.keyboard.press(Key.delete)
-                            self.keyboard.release(Key.delete)
-                        elif(value == 'backspace'):
-                            self.keyboard.press(Key.backspace)
-                            self.keyboard.release(Key.backspace)
-                    else:
-                        self.commands[command] = int(value)
+                    try:
+                        if command == 'wait_to_continue':
+                            self.commands[command] = KeyCode.from_vk(int(value, 16))
+                        elif command == 'delay':
+                            print(f"auto_type-> delay = {value}")
+                            if self._sleep(int(value) / 1000):
+                                return
+                        elif command == 'key':
+                            key = self.KEY_MAP.get(value.strip())
+                            if key is None:
+                                print(f"auto_type-> unknown key: {value}")
+                            else:
+                                self._tap(key)
+                        else:
+                            self.commands[command] = int(value)
+                    except ValueError:
+                        print(f"auto_type-> invalid value for [{command}={value}]")
                 else:
                     for char in segment:
-                        print(f"auto_type-> char = {char}")
                         if self.stop_typing.is_set():
                             return
+                        print(f"auto_type-> char = {char}")
                         self.keyboard.type(char)
-                        time.sleep(self.commands['speed_of_input'] / 1000)                    
+                        if self._sleep(self.commands['speed_of_input'] / 1000):
+                            return
+
                 if self.commands['wait_to_continue'] is not None:
-                    self.wait_listener = Listener(on_press=self.on_press)  # Keep a reference to the listener
+                    if self.stop_typing.is_set():
+                        return
+                    self.wait_listener = Listener(on_press=self.on_press)
                     self.wait_listener.start()
-                    self.wait_listener.join()  # Wait for the key press
+                    # Esc may have been pressed just before the listener existed
+                    if self.stop_typing.is_set():
+                        self.wait_listener.stop()
+                    self.wait_listener.join()  # Wait for the key press (or Esc)
+                    self.wait_listener = None
                     self.commands['wait_to_continue'] = None  # Reset the command
-            time.sleep(self.commands['new_line_delay'] / 1000)
+                    if self.stop_typing.is_set():
+                        return
+
+            if self._sleep(self.commands['new_line_delay'] / 1000):
+                return
             if i < len(lines) - 2:  # If it's not the last line, press enter
-                self.keyboard.press(Key.enter)
-                self.keyboard.release(Key.enter)   
+                self._tap(Key.enter)
         print("auto_type-> end")
 
-
+    def _worker(self, text):
+        try:
+            self.auto_type(text)
+        finally:
+            # Typing finished or was stopped: clean up the Esc listener
+            listener = self.listener
+            if listener is not None:
+                listener.stop()
 
     def run(self):
+        # Ignore clicks on Run while typing is already in progress
+        if self.typing_thread is not None and self.typing_thread.is_alive():
+            return
+
         text = self.text_input.get("1.0", tk.END)
         self.stop_typing.clear()
-        self.typing_thread = threading.Thread(target=self.auto_type, args=(text,))  # Keep a reference to the thread
-        self.typing_thread.start()
-        # Create a global hotkey for the 'Escape' key
-        self.hotkey = keyboard.HotKey(
-            keyboard.HotKey.parse('<esc>'),
-            self.on_hotkey_pressed
-        )
-        # Restart the listener for the hotkey
-        self.listener = keyboard.Listener(
-            on_press=self.for_hotkey,
-            on_release=None
-        )
+        self.commands['wait_to_continue'] = None
+
+        # Start the global Esc listener BEFORE typing begins
+        self.listener = Listener(on_press=self.on_esc_listener_press)
         self.listener.start()
-    
+
+        self.typing_thread = threading.Thread(target=self._worker, args=(text,), daemon=True)
+        self.typing_thread.start()
+
     def start(self):
         self.root.mainloop()
 
     def on_closing(self):
-        # Set the stop_typing event to stop the typing thread
-        self.stop_typing.set()
+        # Stop typing and release any blocking listener
+        self.stop_all()
 
-        # Stop the hotkey listener if it exists
-        if hasattr(self, 'listener') and self.listener is not None:
+        # Stop the Esc listener if it exists
+        if self.listener is not None:
             self.listener.stop()
 
-        # Stop the wait_to_continue listener if it exists
-        if hasattr(self, 'wait_listener') and self.wait_listener is not None:
-            self.wait_listener.stop()
-
-        # If the typing thread is alive, join it
-        if hasattr(self, 'typing_thread') and self.typing_thread.is_alive():
-            self.typing_thread.join()
+        # Wait briefly for the typing thread to finish
+        if self.typing_thread is not None and self.typing_thread.is_alive():
+            self.typing_thread.join(timeout=1)
 
         # Destroy the window
         self.root.destroy()
+
 
 if __name__ == "__main__":
     auto_typer = AutoTyper()
